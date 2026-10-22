@@ -65,7 +65,7 @@ def main():
     print("Test shape:", X_test_processed.shape)
 
     # =========================================
-    # 2. Define the Bayesian logistic model
+    # MARK: Define the Bayesian logistic model
     # =========================================
 
     with pm.Model(coords={"features": feature_names}) as bayes_model:
@@ -99,7 +99,7 @@ def main():
         )
 
         # =====================================
-        # 3. Estimate posterior distributions
+        # MARK: Estimate posterior distributions
         # =====================================
 
         idata = pm.sample(
@@ -188,7 +188,7 @@ def main():
     bayesian_pred = (bayesian_probs >= 0.5).astype(int)
 
     # =========================================
-    # 6. Evaluate the Bayesian model
+    # MARK: Evaluate the Bayesian model
     # =========================================
 
     print("\nBayesian Logistic Regression Results")
