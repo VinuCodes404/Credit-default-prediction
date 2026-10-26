@@ -1,72 +1,148 @@
-import pandas as pd
 
+# ============================================
+# CREDIT CARD DEFAULT PREDICTION
+# Main analysis and training pipeline
+# ============================================
+
+import joblib
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    confusion_matrix, ConfusionMatrixDisplay,
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_curve, roc_auc_score,
+    precision_recall_curve, average_precision_score
+)
 
-from sklearn.metrics import *
+
+# ============================================
+# 1. LOAD DATA AND BASIC EDA
+# ============================================
 
 df = pd.read_csv("Data/UCI_Credit_Card.csv")
+target_column = "default.payment.next.month"
 
-# MARK: EDA
-# Exploratory Data Analysis
-
-# Data info
+print("Original dataset shape:", df.shape)
 print(df.head())
-print("\n")
-print(df.shape)
-print(df.info())
-print(df.isnull().sum())
+print("\nDataset information:")
+df.info()
 
-# Target distribution
-print(df["default.payment.next.month"].value_counts())
+print("\nMissing values:", df.isnull().sum().sum())
 
-sns.countplot(x="default.payment.next.month", data=df)
+print("\nTarget distribution:")
+print(df[target_column].value_counts().sort_index())
+
+sns.countplot(x=target_column, data=df)
 plt.title("Default Payment Distribution")
 plt.xlabel("Default Next Month (0 = No, 1 = Yes)")
 plt.ylabel("Number of Customers")
-# plt.show()
+plt.tight_layout()
+plt.show()
 
-# Inspect categorical features
-print(df["SEX"].value_counts())
-print(df["EDUCATION"].value_counts().sort_index())
-print(df["MARRIAGE"].value_counts().sort_index())
+for col in ["SEX", "EDUCATION", "MARRIAGE"]:
+    print(f"\n{col} distribution:")
+    print(df[col].value_counts().sort_index())
 
-#Inspect numerical features
-# print(df[["LIMIT_BAL", "AGE"]].describe())
+print("\nNumerical summary:")
+print(df[["LIMIT_BAL", "AGE"]].describe())
 
-# MARK: Data Cleaning
-df = df.drop("ID", axis=1)
 
-print(df.duplicated().sum())
+# ============================================
+# 2. DATA CLEANING
+# ============================================
 
-# Dealing with unusual categorical values
-df["EDUCATION"] = df["EDUCATION"].replace(0, 4)
-df["MARRIAGE"] = df["MARRIAGE"].replace(0, 3)
+# Customer ID is not a predictive feature.
+df = df.drop(columns="ID")
 
-# Renaming the target variable for clarity
-df = df.rename(columns={
-    "default.payment.next.month": "default"
-})
+# Check duplicate records without deleting them.
+print("\nDuplicate rows after removing ID:", df.duplicated().sum())
 
-# Separating features and target variable
-X = df.drop("default", axis=1)
+# Pool rare/unknown categories for interpretability.
+df["EDUCATION"] = df["EDUCATION"].replace({0: 4, 5: 4, 6: 4})
+df["MARRIAGE"] = df["MARRIAGE"].replace({0: 3})
+
+df = df.rename(columns={target_column: "default"})
+
+for col in ["EDUCATION", "MARRIAGE"]:
+    print(f"\n{col} values after pooling:")
+    print(df[col].value_counts().sort_index())
+
+# Investigate repeated predictor profiles.
+predictor_cols = df.columns.drop("default")
+duplicate_mask = df.duplicated(subset=predictor_cols, keep=False)
+duplicate_profiles = df.loc[duplicate_mask]
+
+print("\nRows with repeated predictor profiles:", len(duplicate_profiles))
+
+if not duplicate_profiles.empty:
+    target_counts = duplicate_profiles.groupby(
+        list(predictor_cols), dropna=False
+    )["default"].nunique()
+
+    print("Repeated profiles with one target label:", (target_counts == 1).sum())
+    print("Repeated profiles with conflicting targets:", (target_counts > 1).sum())
+
+print("Repeated rows across non-ID columns:", df.duplicated().sum())
+
+
+# ============================================
+# 3. FEATURES, TARGET AND DATA SPLIT
+# ============================================
+
+X = df.drop(columns="default")
 y = df["default"]
 
-# MARK: Data Preprocessing
-categorical_features = [
-    "SEX",
-    "EDUCATION",
-    "MARRIAGE"
-]
+print("\nPredictor count:", X.shape[1])
+
+# Stratified 70/15/15 split.
+X_train, X_temp, y_train, y_temp = train_test_split(
+    X, y,
+    test_size=0.30,
+    random_state=42,
+    stratify=y
+)
+
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp,
+    test_size=0.50,
+    random_state=42,
+    stratify=y_temp
+)
+
+print("\nSplit sizes:")
+for name, split in [
+    ("Training", X_train),
+    ("Validation", X_val),
+    ("Final test", X_test)
+]:
+    print(f"{name}: {len(split)} customers")
+
+print("\nDefault rates by split:")
+for name, target in [
+    ("Training", y_train),
+    ("Validation", y_val),
+    ("Final test", y_test)
+]:
+    print(f"{name}: {target.mean():.4f}")
+
+# Do not use final test outcomes for model selection.
+
+
+# ============================================
+# 4. PREPROCESSING
+# ============================================
+
+categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
 
 numerical_features = [
-    "LIMIT_BAL",
-    "AGE",
+    "LIMIT_BAL", "AGE",
     "PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6",
     "BILL_AMT1", "BILL_AMT2", "BILL_AMT3",
     "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
@@ -74,235 +150,192 @@ numerical_features = [
     "PAY_AMT4", "PAY_AMT5", "PAY_AMT6"
 ]
 
-preprocessor = ColumnTransformer(
-    transformers=[
-        ("num", StandardScaler(), numerical_features),
-        ("cat", OneHotEncoder(drop="first", handle_unknown="ignore"), categorical_features)
-    ]
-)
+preprocessor = ColumnTransformer([
+    ("num", StandardScaler(), numerical_features),
+    ("cat", OneHotEncoder(drop="first", handle_unknown="ignore"),
+     categorical_features)
+])
 
-# MARK: Splitting data
-# stratify=y keeps the default/non-default ratio roughly the same in both sets.
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y
-)
-
-# MARK: Encoding features
+# Fit preprocessing only on training data.
 X_train_processed = preprocessor.fit_transform(X_train)
-X_test_processed = preprocessor.transform(X_test)
+X_val_processed = preprocessor.transform(X_val)
 
-# Comparision
-print("Original training shape:", X_train.shape)
-print("Processed training shape:", X_train_processed.shape)
+print("\nProcessed shapes:")
+print("Training:", X_train_processed.shape)
+print("Validation:", X_val_processed.shape)
 
-# MARK: Data Modelling
-from sklearn.linear_model import LogisticRegression
+
+# ============================================
+# 5. TRAIN LOGISTIC REGRESSION
+# ============================================
 
 model = LogisticRegression(max_iter=1000)
-
 model.fit(X_train_processed, y_train)
 
-y_pred = model.predict(X_test_processed)
-y_prob = model.predict_proba(X_test_processed)
-
-# Few outputs that the model predicted
-print("Predicted classes:")
-print(y_pred[:10])
-
-print("\nPredicted probabilities:")
-print(y_prob[:10])
-
-print("\nDefault probabilities:")
-print(y_prob[:10, 1])
+print("\nLogistic regression training complete.")
 
 
-# Confusion matrix
-from sklearn.metrics import confusion_matrix
+# ============================================
+# 6. SELECT THRESHOLD ON VALIDATION DATA
+# ============================================
 
-cm = confusion_matrix(y_test, y_pred)
-print("\n")
-print(cm)
+val_probs = model.predict_proba(X_val_processed)[:, 1]
+candidate_thresholds = np.arange(0.05, 0.951, 0.01)
 
-# MARK: Evaluation Metrics
-# Variance Matrix
-accuracy = accuracy_score(y_test, y_pred)
-print("Accuracy:", accuracy)
+threshold_results = [
+    {
+        "threshold": float(t),
+        "f1": f1_score(
+            y_val, (val_probs >= t).astype(int), zero_division=0
+        )
+    }
+    for t in candidate_thresholds
+]
 
-precision = precision_score(y_test, y_pred)
-print("Precision:", precision)
+# Select the threshold with the highest validation F1-score.
+best_result = max(threshold_results, key=lambda result: result["f1"])
+best_threshold = best_result["threshold"]
+y_val_pred = (val_probs >= best_threshold).astype(int)
 
-recall = recall_score(y_test, y_pred)
-print("Recall:", recall)
+print("\nThreshold selected using validation data:")
+print(f"Threshold: {best_threshold:.3f}")
+print(f"Validation F1: {best_result['f1']:.3f}")
 
-f1 = f1_score(y_test, y_pred)
-print("F1 Score:", f1)
 
-# ROC - AUC curve
-import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, roc_auc_score
+# ============================================
+# 7. VALIDATION METRICS
+# ============================================
 
-# Extract the probability of default (class 1)
-default_probs = y_prob[:, 1]
+metrics = {
+    "Accuracy": accuracy_score(y_val, y_val_pred),
+    "Precision": precision_score(y_val, y_val_pred, zero_division=0),
+    "Recall": recall_score(y_val, y_val_pred, zero_division=0),
+    "F1-score": f1_score(y_val, y_val_pred, zero_division=0),
+    "ROC-AUC": roc_auc_score(y_val, val_probs),
+    "Average Precision": average_precision_score(y_val, val_probs)
+}
 
-# Calculate ROC curve points
-fpr, tpr, thresholds = roc_curve(y_test, default_probs)
+print("\nVALIDATION RESULTS")
+print("------------------")
+for name, value in metrics.items():
+    print(f"{name}: {value:.3f}")
 
-# Calculate AUC
-roc_auc = roc_auc_score(y_test, default_probs)
 
-print("ROC-AUC:", roc_auc)
+# ============================================
+# 8. VALIDATION CONFUSION MATRIX
+# ============================================
 
-# Plot ROC curve
+ConfusionMatrixDisplay(
+    confusion_matrix(y_val, y_val_pred),
+    display_labels=["No Default", "Default"]
+).plot()
+
+plt.title("Validation Confusion Matrix")
+plt.tight_layout()
+plt.show()
+
+
+# ============================================
+# 9. ROC AND PRECISION-RECALL CURVES
+# ============================================
+
+fpr, tpr, _ = roc_curve(y_val, val_probs)
+
 plt.figure(figsize=(8, 6))
-
-plt.plot(fpr, tpr, label=f"Logistic Regression (AUC = {roc_auc:.3f})")
+plt.plot(fpr, tpr, label=f"Logistic Regression (AUC = {metrics['ROC-AUC']:.3f})")
 plt.plot([0, 1], [0, 1], "k--", label="Random Classifier")
-
 plt.xlabel("False Positive Rate")
 plt.ylabel("True Positive Rate (Recall)")
-plt.title("ROC Curve — Credit Card Default Prediction")
+plt.title("Validation ROC Curve")
 plt.legend()
 plt.grid(alpha=0.3)
+plt.tight_layout()
 plt.show()
 
-# precision - recall curve
-from sklearn.metrics import (
-    precision_recall_curve,
-    average_precision_score
-)
-import matplotlib.pyplot as plt
+pr_precision, pr_recall, _ = precision_recall_curve(y_val, val_probs)
+baseline = y_val.mean()
 
-# Calculate precision-recall values
-precision_values, recall_values, pr_thresholds = (
-    precision_recall_curve(y_test, default_probs)
-)
-
-# Calculate Average Precision
-avg_precision = average_precision_score(y_test, default_probs)
-
-# Baseline: proportion of actual defaulters
-baseline = y_test.mean()
-
-print("Average Precision:", avg_precision)
-print("Baseline precision:", baseline)
-
-# Plot the curve
 plt.figure(figsize=(8, 6))
-
 plt.plot(
-    recall_values,
-    precision_values,
-    label=f"Logistic Regression (AP = {avg_precision:.3f})"
+    pr_recall, pr_precision,
+    label=f"Logistic Regression (AP = {metrics['Average Precision']:.3f})"
 )
-
 plt.axhline(
-    y=baseline,
-    color="black",
-    linestyle="--",
+    y=baseline, color="black", linestyle="--",
     label=f"Baseline = {baseline:.3f}"
 )
-
 plt.xlabel("Recall")
 plt.ylabel("Precision")
-plt.title("Precision-Recall Curve — Credit Card Default Prediction")
+plt.title("Validation Precision-Recall Curve")
 plt.legend()
 plt.grid(alpha=0.3)
+plt.tight_layout()
 plt.show()
 
-####################################
-# MARK: Experimnenting with threshold
-####################################
-from sklearn.metrics import (
-    precision_score,
-    recall_score,
-    f1_score
-)
 
-for threshold in [0.5, 0.4, 0.3, 0.2]:
-    y_pred_threshold = (default_probs >= threshold).astype(int)
+# ============================================
+# 10. COEFFICIENT ANALYSIS
+# ============================================
 
-    precision = precision_score(y_test, y_pred_threshold)
-    recall = recall_score(y_test, y_pred_threshold)
-    f1 = f1_score(y_test, y_pred_threshold)
-
-    print(f"\nThreshold: {threshold}")
-    print(f"Precision: {precision:.3f}")
-    print(f"Recall:    {recall:.3f}")
-    print(f"F1-score:  {f1:.3f}")
-
-# MARK: Feature Analysis
-# Inspecting the model's coefficients
-import pandas as pd
-
-# Get names of the processed features
 feature_names = preprocessor.get_feature_names_out()
 
-# Get coefficients learned by logistic regression
-coefficients = model.coef_[0]
-
-# Create a table
 coef_df = pd.DataFrame({
     "Feature": feature_names,
-    "Coefficient": coefficients
+    "Coefficient": model.coef_[0]
 })
-
-# Strongest positive coefficients
-print("Features pushing predictions toward default:")
-print(
-    coef_df.nlargest(10, "Coefficient")
-          .to_string(index=False)
-)
-
-# Strongest negative coefficients
-print("\nFeatures pushing predictions away from default:")
-print(
-    coef_df.nsmallest(10, "Coefficient")
-          .to_string(index=False)
-)
-
-# Visualize the coefficients
-import matplotlib.pyplot as plt
 
 top_positive = coef_df.nlargest(10, "Coefficient")
 top_negative = coef_df.nsmallest(10, "Coefficient")
 
+print("\nLargest positive logistic regression coefficients:")
+print(top_positive.to_string(index=False))
+
+print("\nLargest negative logistic regression coefficients:")
+print(top_negative.to_string(index=False))
+
 fig, axes = plt.subplots(1, 2, figsize=(14, 7))
 
-axes[0].barh(
-    top_positive["Feature"],
-    top_positive["Coefficient"]
-)
-axes[0].set_title("Features Pushing Toward Default")
-axes[0].set_xlabel("Coefficient")
-
-axes[1].barh(
-    top_negative["Feature"],
-    top_negative["Coefficient"]
-)
-axes[1].set_title("Features Pushing Away from Default")
-axes[1].set_xlabel("Coefficient")
+for ax, data, title in [
+    (axes[0], top_positive, "Largest Positive Coefficients"),
+    (axes[1], top_negative, "Largest Negative Coefficients")
+]:
+    data = data.sort_values("Coefficient")
+    ax.barh(data["Feature"], data["Coefficient"])
+    ax.set_title(title)
+    ax.set_xlabel("Coefficient (log-odds scale)")
 
 plt.tight_layout()
 plt.show()
 
-# Variable Share
-import joblib
 
-# Save the trained model and the fitted preprocessor
-joblib.dump(
-    {
-        "model": model,
-        "preprocessor": preprocessor,
-        "X_train": X_train,
-        "X_test": X_test,
-        "y_train": y_train,
-        "y_test": y_test
+# ============================================
+# 11. SAVE MODEL ARTIFACTS
+# ============================================
+
+artifacts = {
+    "model": model,
+    "preprocessor": preprocessor,
+    "X_train": X_train,
+    "y_train": y_train,
+    "X_val": X_val,
+    "y_val": y_val,
+    "X_test": X_test,
+    "y_test": y_test,
+    "best_threshold": best_threshold,
+    "feature_names": feature_names,
+    "category_pooling": {
+        "EDUCATION": {"pooled_values": [0, 4, 5, 6], "replacement_code": 4},
+        "MARRIAGE": {"pooled_values": [0, 3], "replacement_code": 3}
     },
-    "model_artifacts.joblib"
-)
+    "split_strategy": {
+        "training": 0.70,
+        "validation": 0.15,
+        "test": 0.15,
+        "random_state": 42
+    }
+}
 
-print("Model artifacts saved successfully.")
+joblib.dump(artifacts, "model_artifacts.joblib")
+
+print("\nFresh model artifacts saved.")
+print("Final test metrics have NOT been calculated.")

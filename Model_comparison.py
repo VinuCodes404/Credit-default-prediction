@@ -1,12 +1,14 @@
+# ============================================
+# MODEL COMPARISON
+# Standard vs Bayesian Logistic Regression
+# ============================================
+
 import joblib
 import arviz as az
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from scipy import sparse
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -17,126 +19,81 @@ from sklearn.metrics import (
 )
 
 
-# =========================================
-# 1. Load existing artifacts
-# =========================================
+# ============================================
+# 1. LOAD REVISED ARTIFACTS
+# ============================================
 
 artifacts = joblib.load("model_artifacts.joblib")
 
-full_model = artifacts["model"]
+model = artifacts["model"]
 preprocessor = artifacts["preprocessor"]
 
-X_train = artifacts["X_train"]
-y_train = artifacts["y_train"]
-X_test = artifacts["X_test"]
-y_test = artifacts["y_test"]
+X_val = artifacts["X_val"]
+y_val = np.asarray(artifacts["y_val"])
 
+standard_threshold = artifacts["best_threshold"]
 
-# =========================================
-# 2. Recreate the same 6,000-row sample
-#    used by Bayesian Logistic Regression
-# =========================================
-
-X_bayes_raw, _, y_bayes, _ = train_test_split(
-    X_train,
-    y_train,
-    train_size=6000,
-    random_state=42,
-    stratify=y_train
+bayesian_results = joblib.load(
+    "bayesian_validation_results.joblib"
 )
 
-X_bayes = preprocessor.transform(X_bayes_raw)
-X_test_processed = preprocessor.transform(X_test)
-
-if sparse.issparse(X_bayes):
-    X_bayes = X_bayes.toarray()
-
-if sparse.issparse(X_test_processed):
-    X_test_processed = X_test_processed.toarray()
-
-X_bayes = np.asarray(X_bayes, dtype=float)
-X_test_processed = np.asarray(X_test_processed, dtype=float)
-
-y_bayes = np.asarray(y_bayes, dtype=int)
-y_test = np.asarray(y_test, dtype=int)
-
-
-# =========================================
-# 3. Train standard Logistic Regression
-#    on the SAME 6,000 training customers
-# =========================================
-
-standard_6k = LogisticRegression(max_iter=1000)
-
-standard_6k.fit(X_bayes, y_bayes)
-
-standard_probs = standard_6k.predict_proba(
-    X_test_processed
-)[:, 1]
-
-standard_pred = (standard_probs >= 0.5).astype(int)
-
-
-# =========================================
-# 4. Load Bayesian posterior samples
-# =========================================
-
-idata = az.from_netcdf("bayesian_trace.nc")
-
-posterior_intercept = (
-    idata.posterior["intercept"].values.reshape(-1)
+bayesian_probs = np.asarray(
+    bayesian_results["validation_probabilities"]
 )
 
-n_features = X_bayes.shape[1]
+bayesian_targets = np.asarray(
+    bayesian_results["validation_targets"]
+)
 
-posterior_beta = (
-    idata.posterior["beta"].values.reshape(
-        -1, n_features
+bayesian_threshold = bayesian_results[
+    "bayesian_best_threshold"
+]
+
+
+# Ensure both models use the same validation targets.
+if not np.array_equal(y_val, bayesian_targets):
+    raise ValueError(
+        "The standard and Bayesian validation targets differ. "
+        "Recheck the saved artifacts before comparison."
     )
-)
-
-# Use up to 1,000 posterior draws for prediction
-indices = np.linspace(
-    0,
-    len(posterior_intercept) - 1,
-    min(1000, len(posterior_intercept)),
-    dtype=int
-)
-
-posterior_intercept = posterior_intercept[indices]
-posterior_beta = posterior_beta[indices]
-
-logits = (
-    posterior_intercept[:, None]
-    + posterior_beta @ X_test_processed.T
-)
-
-logits = np.clip(logits, -30, 30)
-
-posterior_probs = 1 / (1 + np.exp(-logits))
-
-bayesian_probs = posterior_probs.mean(axis=0)
-bayesian_pred = (bayesian_probs >= 0.5).astype(int)
 
 
-# =========================================
-# 5. Evaluate all three models
-# =========================================
+# ============================================
+# 2. STANDARD MODEL VALIDATION PREDICTIONS
+# ============================================
 
-full_probs = full_model.predict_proba(
-    X_test_processed
+X_val_processed = preprocessor.transform(X_val)
+
+standard_probs = model.predict_proba(
+    X_val_processed
 )[:, 1]
 
-full_pred = (full_probs >= 0.5).astype(int)
+standard_pred = (
+    standard_probs >= standard_threshold
+).astype(int)
 
+bayesian_pred = (
+    bayesian_probs >= bayesian_threshold
+).astype(int)
+
+
+# ============================================
+# 3. COMPARE VALIDATION METRICS
+# ============================================
 
 def evaluate_model(name, actual, predicted, probabilities):
     return {
         "Model": name,
         "Accuracy": accuracy_score(actual, predicted),
-        "Precision": precision_score(actual, predicted),
-        "Recall": recall_score(actual, predicted),
-        "F1-score": f1_score(actual, predicted),
+        "Precision": precision_score(
+            actual, predicted, zero_division=0
+        ),
+        "Recall": recall_score(
+            actual, predicted, zero_division=0
+        ),
+        "F1-score": f1_score(
+            actual, predicted, zero_division=0
+        ),
         "ROC-AUC": roc_auc_score(actual, probabilities),
         "Average Precision": average_precision_score(
             actual, probabilities
@@ -146,26 +103,38 @@ def evaluate_model(name, actual, predicted, probabilities):
 
 results = pd.DataFrame([
     evaluate_model(
-        "Standard (24k training)",
-        y_test, full_pred, full_probs
+        "Standard Logistic Regression",
+        y_val,
+        standard_pred,
+        standard_probs
     ),
     evaluate_model(
-        "Standard (6k training)",
-        y_test, standard_pred, standard_probs
-    ),
-    evaluate_model(
-        "Bayesian (6k training)",
-        y_test, bayesian_pred, bayesian_probs
+        "Bayesian Logistic Regression",
+        y_val,
+        bayesian_pred,
+        bayesian_probs
     )
 ])
 
-print("\nMODEL COMPARISON")
+print("\nVALIDATION MODEL COMPARISON")
+print("===========================")
+print("Training customers: 21,000")
+print("Validation customers: 4,500")
+print("Final test set used: No")
+
+print("\nSelected thresholds:")
+print(f"Standard: {standard_threshold:.3f}")
+print(f"Bayesian: {bayesian_threshold:.3f}")
+
+print("\nMetrics:")
 print(results.round(3).to_string(index=False))
 
 
-# =========================================
-# 6. Bayesian coefficient intervals
-# =========================================
+# ============================================
+# 4. BAYESIAN COEFFICIENT INTERVAL PLOT
+# ============================================
+
+idata = az.from_netcdf("bayesian_trace.nc")
 
 summary = az.summary(
     idata,
@@ -174,55 +143,54 @@ summary = az.summary(
     round_to=4
 )
 
-# Extract feature names and posterior estimates
-coef_df = summary.reset_index()
-
-coef_df = coef_df.rename(
-    columns={
-        "index": "Feature",
-        "eti95_lb": "Lower",
-        "eti95_ub": "Upper"
-    }
+coef_df = (
+    summary
+    .rename_axis("Parameter")
+    .reset_index()
 )
 
-# Compatibility with ArviZ versions that name
-# the index column differently
-if "Feature" not in coef_df.columns:
-    coef_df = coef_df.rename(
-        columns={coef_df.columns[0]: "Feature"}
-    )
+# Keep feature coefficients, excluding the intercept.
+coef_df = coef_df[
+    coef_df["Parameter"].str.startswith("beta[")
+].copy()
 
-coef_df["Feature"] = coef_df["Feature"].str.replace(
-    "beta[", "", regex=False
-).str.replace("]", "", regex=False)
+coef_df["Feature"] = (
+    coef_df["Parameter"]
+    .str.removeprefix("beta[")
+    .str.removesuffix("]")
+)
 
 coef_df = coef_df.sort_values("mean")
 
-# Draw the posterior mean and 95% intervals
-plt.figure(figsize=(10, 12))
+# Asymmetric intervals around each posterior mean.
+lower_error = coef_df["mean"] - coef_df["eti95_lb"]
+upper_error = coef_df["eti95_ub"] - coef_df["mean"]
 
-xerr = np.vstack([
-    coef_df["mean"] - coef_df["Lower"],
-    coef_df["Upper"] - coef_df["mean"]
-])
+fig, ax = plt.subplots(figsize=(10, 12))
 
-plt.errorbar(
+ax.errorbar(
     coef_df["mean"],
     coef_df["Feature"],
-    xerr=xerr,
+    xerr=np.vstack([lower_error, upper_error]),
     fmt="o",
     capsize=3
 )
 
-plt.axvline(0, color="black", linestyle="--")
+ax.axvline(
+    0,
+    color="black",
+    linestyle="--",
+    label="Zero coefficient"
+)
 
-plt.xlabel("Posterior Coefficient")
-plt.ylabel("Feature")
-plt.title(
+ax.set_xlabel("Posterior Mean Coefficient")
+ax.set_ylabel("Feature")
+ax.set_title(
     "Bayesian Logistic Regression: "
     "Posterior Means and 95% Credible Intervals"
 )
 
+ax.legend()
 plt.tight_layout()
 
 plt.savefig(
@@ -232,3 +200,6 @@ plt.savefig(
 )
 
 plt.show()
+
+print("\nCoefficient interval plot saved.")
+print("Final test set remains untouched.")

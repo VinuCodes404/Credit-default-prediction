@@ -4,7 +4,6 @@ import numpy as np
 import pymc as pm
 
 from scipy import sparse
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -15,214 +14,243 @@ from sklearn.metrics import (
 )
 
 
-def main():
+# 1. LOAD REVISED ARTIFACTS
 
-    # =========================================
-    # 1. Load our existing saved artifacts
-    # =========================================
+artifacts = joblib.load("model_artifacts.joblib")
 
-    artifacts = joblib.load("model_artifacts.joblib")
+preprocessor = artifacts["preprocessor"]
 
-    preprocessor = artifacts["preprocessor"]
-    X_train = artifacts["X_train"]
-    y_train = artifacts["y_train"]
-    X_test = artifacts["X_test"]
-    y_test = artifacts["y_test"]
+X_train = artifacts["X_train"]
+y_train = artifacts["y_train"]
 
-    # Use 6,000 training customers for this
-    # initial Bayesian experiment.
-    X_bayes_raw, _, y_bayes, _ = train_test_split(
-        X_train,
-        y_train,
-        train_size=6000,
-        random_state=42,
-        stratify=y_train
+X_val = artifacts["X_val"]
+y_val = artifacts["y_val"]
+
+print("Training customers:", len(X_train))
+print("Validation customers:", len(X_val))
+
+
+# 2. TRANSFORM FEATURES
+
+# The preprocessor is already fitted on training data.
+X_train_processed = preprocessor.transform(X_train)
+X_val_processed = preprocessor.transform(X_val)
+
+if sparse.issparse(X_train_processed):
+    X_train_processed = X_train_processed.toarray()
+
+if sparse.issparse(X_val_processed):
+    X_val_processed = X_val_processed.toarray()
+
+X_train_processed = np.asarray(
+    X_train_processed, dtype=np.float64
+)
+
+X_val_processed = np.asarray(
+    X_val_processed, dtype=np.float64
+)
+
+y_train_array = np.asarray(y_train, dtype=np.int8)
+y_val_array = np.asarray(y_val, dtype=np.int8)
+
+feature_names = preprocessor.get_feature_names_out()
+n_features = X_train_processed.shape[1]
+
+
+# 3. DEFINE BAYESIAN MODEL
+
+with pm.Model(coords={"features": feature_names}) as bayes_model:
+
+    # Prior for intercept
+    intercept = pm.Normal(
+        "intercept",
+        mu=0,
+        sigma=1.5
     )
 
-    # Use the existing fitted preprocessor.
-    X_bayes = preprocessor.transform(X_bayes_raw)
-    X_test_processed = preprocessor.transform(X_test)
-
-    # Convert sparse matrices if necessary.
-    if sparse.issparse(X_bayes):
-        X_bayes = X_bayes.toarray()
-
-    if sparse.issparse(X_test_processed):
-        X_test_processed = X_test_processed.toarray()
-
-    X_bayes = np.asarray(X_bayes, dtype=np.float64)
-    X_test_processed = np.asarray(
-        X_test_processed, dtype=np.float64
+    # Prior distributions for coefficients
+    beta = pm.Normal(
+        "beta",
+        mu=0,
+        sigma=1,
+        dims="features"
     )
 
-    y_bayes = np.asarray(y_bayes, dtype=np.int8)
-    y_test = np.asarray(y_test, dtype=np.int8)
-
-    feature_names = preprocessor.get_feature_names_out()
-    n_features = X_bayes.shape[1]
-
-    print("Bayesian training shape:", X_bayes.shape)
-    print("Test shape:", X_test_processed.shape)
-
-    # =========================================
-    # MARK: Define the Bayesian logistic model
-    # =========================================
-
-    with pm.Model(coords={"features": feature_names}) as bayes_model:
-
-        # Prior for the intercept
-        intercept = pm.Normal(
-            "intercept",
-            mu=0,
-            sigma=1.5
-        )
-
-        # Priors for feature coefficients
-        beta = pm.Normal(
-            "beta",
-            mu=0,
-            sigma=1,
-            dims="features"
-        )
-
-        # Weighted sum of the features
-        logits = intercept + pm.math.dot(X_bayes, beta)
-
-        # Convert scores into probabilities
-        probability = pm.math.sigmoid(logits)
-
-        # Likelihood: observed default outcomes
-        pm.Bernoulli(
-            "observed_default",
-            p=probability,
-            observed=y_bayes
-        )
-
-        # =====================================
-        # MARK: Estimate posterior distributions
-        # =====================================
-
-        idata = pm.sample(
-            draws=1000,
-            tune=1000,
-            chains=4,
-            cores=2,
-            random_seed=42,
-            nuts={"target_accept": 0.9},
-            return_inferencedata=True
-        )
-
-    # Save posterior samples for later analysis
-    idata.to_netcdf("bayesian_trace.nc")
-
-    # =========================================
-    # 4. Examine posterior coefficients
-    # =========================================
-
-    summary = az.summary(
-        idata,
-        var_names=["intercept", "beta"],
-        ci_prob=0.95,
-        round_to=3
+    # Weighted sum of features
+    logits = intercept + pm.math.dot(
+        X_train_processed, beta
     )
 
-    print("\nPosterior coefficient summary:")
-    print(summary)
+    # Convert scores into probabilities
+    probability = pm.math.sigmoid(logits)
 
-    print("\nMaximum R-hat:")
-    print(summary["r_hat"].max())
-
-    beta_summary = summary.drop(index="intercept")
-
-    print("\nStrongest positive posterior means:")
-    print(
-        beta_summary.sort_values("mean", ascending=False)
-        .head(8)
+    # Likelihood: observed customer outcomes
+    pm.Bernoulli(
+        "observed_default",
+        p=probability,
+        observed=y_train_array
     )
 
-    print("\nStrongest negative posterior means:")
-    print(
-        beta_summary.sort_values("mean")
-        .head(8)
-    )
+    # 4. SAMPLE POSTERIOR DISTRIBUTIONS
 
-    # =========================================
-    # 5. Predict on the untouched test set
-    # =========================================
-
-    posterior_intercept = (
-        idata.posterior["intercept"].values.reshape(-1)
-    )
-
-    posterior_beta = (
-        idata.posterior["beta"].values.reshape(
-            -1, n_features
-        )
-    )
-
-    # Use up to 1,000 posterior draws for prediction.
-    indices = np.linspace(
-        0,
-        len(posterior_intercept) - 1,
-        min(1000, len(posterior_intercept)),
-        dtype=int
-    )
-
-    posterior_intercept = posterior_intercept[indices]
-    posterior_beta = posterior_beta[indices]
-
-    # Calculate a probability for every posterior draw.
-    logits_test = (
-        posterior_intercept[:, None]
-        + posterior_beta @ X_test_processed.T
-    )
-
-    logits_test = np.clip(logits_test, -30, 30)
-
-    probabilities = 1 / (1 + np.exp(-logits_test))
-
-    # Average probabilities over the posterior draws.
-    bayesian_probs = probabilities.mean(axis=0)
-
-    # Use 0.5 for the initial classification comparison.
-    bayesian_pred = (bayesian_probs >= 0.5).astype(int)
-
-    # =========================================
-    # MARK: Evaluate the Bayesian model
-    # =========================================
-
-    print("\nBayesian Logistic Regression Results")
-
-    print(
-        "Accuracy:",
-        round(accuracy_score(y_test, bayesian_pred), 3)
-    )
-
-    print(
-        "Precision:",
-        round(precision_score(y_test, bayesian_pred), 3)
-    )
-
-    print(
-        "Recall:",
-        round(recall_score(y_test, bayesian_pred), 3)
-    )
-
-    print(
-        "F1-score:",
-        round(f1_score(y_test, bayesian_pred), 3)
-    )
-
-    print(
-        "ROC-AUC:",
-        round(roc_auc_score(y_test, bayesian_probs), 3)
-    )
-
-    print(
-        "Average Precision:",
-        round(average_precision_score(y_test, bayesian_probs), 3)
+    idata = pm.sample(
+        draws=1000,
+        tune=1000,
+        chains=4,
+        cores=2,
+        random_seed=42,
+        nuts={"target_accept": 0.9},
+        return_inferencedata=True
     )
 
 
-if __name__ == "__main__":
-    main()
+# Save the posterior samples
+idata.to_netcdf("bayesian_trace.nc")
+
+
+# 5. CHECK SAMPLING DIAGNOSTICS
+
+summary = az.summary(
+    idata,
+    var_names=["intercept", "beta"],
+    ci_prob=0.95,
+    round_to=3
+)
+
+print("\nPOSTERIOR COEFFICIENT SUMMARY")
+print(summary)
+
+print("\nMaximum R-hat:", round(summary["r_hat"].max(), 3))
+
+
+# 6. PREDICT VALIDATION PROBABILITIES
+
+posterior_intercept = (
+    idata.posterior["intercept"]
+    .values.reshape(-1)
+)
+
+posterior_beta = (
+    idata.posterior["beta"]
+    .values.reshape(-1, n_features)
+)
+
+# Use up to 1,000 posterior draws for prediction.
+indices = np.linspace(
+    0,
+    len(posterior_intercept) - 1,
+    min(1000, len(posterior_intercept)),
+    dtype=int
+)
+
+posterior_intercept = posterior_intercept[indices]
+posterior_beta = posterior_beta[indices]
+
+logits_val = (
+    posterior_intercept[:, None]
+    + posterior_beta @ X_val_processed.T
+)
+
+logits_val = np.clip(logits_val, -30, 30)
+
+probabilities_val = 1 / (1 + np.exp(-logits_val))
+
+# Average predictions across posterior draws.
+bayesian_val_probs = probabilities_val.mean(axis=0)
+
+
+# ============================================
+# 7. SELECT THRESHOLD USING VALIDATION DATA
+# ============================================
+
+candidate_thresholds = np.arange(0.05, 0.951, 0.01)
+
+threshold_results = []
+
+for threshold in candidate_thresholds:
+
+    val_pred = (
+        bayesian_val_probs >= threshold
+    ).astype(int)
+
+    score = f1_score(
+        y_val_array,
+        val_pred,
+        zero_division=0
+    )
+
+    threshold_results.append({
+        "threshold": float(threshold),
+        "f1": score
+    })
+
+best_result = max(
+    threshold_results,
+    key=lambda result: result["f1"]
+)
+
+bayesian_best_threshold = best_result["threshold"]
+
+print("\nBayesian threshold selected on validation data:")
+print("Threshold:", round(bayesian_best_threshold, 3))
+print("Validation F1:", round(best_result["f1"], 3))
+
+
+# 8. VALIDATION EVALUATION
+
+bayesian_val_pred = (
+    bayesian_val_probs >= bayesian_best_threshold
+).astype(int)
+
+print("\nBAYESIAN VALIDATION RESULTS")
+print("---------------------------")
+
+print("Accuracy:",
+      round(accuracy_score(
+          y_val_array, bayesian_val_pred
+      ), 3))
+
+print("Precision:",
+      round(precision_score(
+          y_val_array, bayesian_val_pred,
+          zero_division=0
+      ), 3))
+
+print("Recall:",
+      round(recall_score(
+          y_val_array, bayesian_val_pred,
+          zero_division=0
+      ), 3))
+
+print("F1-score:",
+      round(f1_score(
+          y_val_array, bayesian_val_pred,
+          zero_division=0
+      ), 3))
+
+print("ROC-AUC:",
+      round(roc_auc_score(
+          y_val_array, bayesian_val_probs
+      ), 3))
+
+print("Average Precision:",
+      round(average_precision_score(
+          y_val_array, bayesian_val_probs
+      ), 3))
+
+
+# 9. SAVE BAYESIAN VALIDATION RESULTS
+
+joblib.dump(
+    {
+        "bayesian_best_threshold": bayesian_best_threshold,
+        "validation_probabilities": bayesian_val_probs,
+        "validation_predictions": bayesian_val_pred,
+        "validation_targets": y_val_array
+    },
+    "bayesian_validation_results.joblib"
+)
+
+print("\nBayesian posterior saved.")
+print("Bayesian validation results saved.")
+print("Final test set remains untouched.")
